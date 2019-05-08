@@ -81,37 +81,32 @@ func (s *coinServer) RemoveCoins(ctx context.Context, request *coin_service.Remo
 		// as we iterate through coinsInPot, populate coinCounter and increment totalCoins
 		coinCounter[coin.Denomination] = coin.CoinCount
 		totalCoins += coin.CoinCount
-
 		// retrieve the coin model, selected by coin.ID, this step is probably not necessary if
 		// we re-write models.CoinsInPotsByPot_id
 		modelCoin, err := models.CoinByID(s.DB, coin.ID)
-
 		if err != nil {
 			return nil, twirp.InternalError(err.Error())
 		}
-
 		// populate dbModelCoins
 		dbModelCoins[modelCoin.Denomination] = modelCoin
 	}
 
 	// begin shaking the piggy bank
 	for i := 0; i < int(count); i++ {
-		// simulate chance using rng
+		// simulate chance using rng.
 		chance := rand.Float64()
-		// coinProb maps the denomination with its % distribution in the pot
-		coinProb := map[int32]float64{}
-
+		// iterate through all coins in coinCounter
 		for denom, count := range coinCounter {
-			coinProb[denom] = float64(count) / float64(totalCoins)
-		}
-
-		for denom, prob := range coinProb {
+			// prob is the % distribution of a coin in the pot
+			prob := float64(count) / float64(totalCoins)
+			// we decrement chance by prob, if chance decrements below 0, we have
+			// randomly shaken the piggy bank such that that denomination falls out
 			chance -= prob
 			if chance < 0 {
 				coinCounter[denom]--
 				totalCoins--
+				// if last coin is removed, delete it from the map
 				if coinCounter[denom] == 0 {
-					fmt.Println("DELETING", denom)
 					delete(coinCounter, denom)
 				}
 				break
@@ -119,30 +114,36 @@ func (s *coinServer) RemoveCoins(ctx context.Context, request *coin_service.Remo
 		}
 	}
 
+	// begin process to update DB
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return nil, twirp.InternalError(err.Error())
 	}
 
+	// if the coin no longer exists in the piggy bank, delete it from db
 	for denom, coin := range dbModelCoins {
 		if _, ok := coinCounter[denom]; !ok {
-			fmt.Println("SQL DELETE", coin.Denomination)
 			err = coin.Delete(tx)
 		}
 	}
 
+	// declare response slice
 	var res []*coin_service.Coins
 
+	// iterate through the coins in coinCounter
 	for denom, count := range coinCounter {
 
-		coin, _ := dbModelCoins[denom]
+		coin := dbModelCoins[denom]
+		// update the CoinCount property on the coin model
 		coin.CoinCount = count
 
+		// save coin
 		err = coin.Save(tx)
 		if err != nil {
-			return nil, twirp.InvalidArgumentError(err.Error(), "")
+			return nil, twirp.InternalError(err.Error())
 		}
 
+		// add a ptr to a coin_service.Coins struct to the res slice
 		res = append(res, &coin_service.Coins{
 			Kind:  coin_service.Coins_Kind(denom),
 			Count: count,
