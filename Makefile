@@ -96,6 +96,7 @@ models:
 	source sql/config && $(XO) $$DB --int32-type int32 -o $(MODEL_PATH) --template-path $(TEMPLATE_PATH)
 	source sql/config && $(XO) $$DB --int32-type int32 -o $(MODEL_PATH) --query-mode --query-type PotsPaged --query-trim < sql/pots_paged.query.sql
 	source sql/config && $(XO) $$DB --int32-type int32 -o $(MODEL_PATH) --query-mode --query-type CoinsInPot --query-trim < sql/coins_in_pot.query.sql
+	source sql/config && $(XO) $$DB --int32-type int32 -o $(MODEL_PATH) --query-mode --query-type PotById --query-trim < sql/pot_by_id.query.sql
 
 resetdb: clean_db clean_models db
 

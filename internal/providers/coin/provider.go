@@ -5,9 +5,10 @@ import (
 	"database/sql"
 	"fmt"
 	"math/rand"
+	"time"
 
 	"github.com/aspiration-labs/pyggpot/internal/models"
-	coin_service "github.com/aspiration-labs/pyggpot/rpc/go/coin"
+	"github.com/aspiration-labs/pyggpot/rpc/go/coin"
 	"github.com/twitchtv/twirp"
 )
 
@@ -42,7 +43,6 @@ func (s *coinServer) AddCoins(ctx context.Context, request *coin_service.AddCoin
 			return nil, twirp.InvalidArgumentError(err.Error(), "")
 		}
 	}
-
 	err = tx.Commit()
 	if err != nil {
 		return nil, twirp.NotFoundError(err.Error())
@@ -54,100 +54,74 @@ func (s *coinServer) AddCoins(ctx context.Context, request *coin_service.AddCoin
 }
 
 func (s *coinServer) RemoveCoins(ctx context.Context, request *coin_service.RemoveCoinsRequest) (*coin_service.CoinsListResponse, error) {
-
 	if err := request.Validate(); err != nil {
 		return nil, twirp.InvalidArgumentError(err.Error(), "")
 	}
 
-	// get potID and count information from request
-	potID := request.PotId
-	count := request.Count
-
-	// first query db for all the coins in particular pot, selected by potID
-	coinsInPot, err := models.CoinsInPotsByPot_id(s.DB, int(potID))
-
-	if err != nil {
-		return nil, twirp.InternalError(err.Error())
-	}
-
-	// coinCounter is a map where key is the denomination and value is the coin count at that denomination
-	coinCounter := make(map[int32]int32)
-	// totalCoins keeps track of total coins in the pot. Can probably be retrieved from SQL
-	var totalCoins int32
-	// dbModelCoins is a map where key is the denomination and value is a point to models.Coin
-	dbModelCoins := make(map[int32]*models.Coin)
-
-	for _, coin := range coinsInPot {
-		// as we iterate through coinsInPot, populate coinCounter and increment totalCoins
-		coinCounter[coin.Denomination] = coin.CoinCount
-		totalCoins += coin.CoinCount
-		// retrieve the coin model, selected by coin.ID, this step is probably not necessary if
-		// we re-write models.CoinsInPotsByPot_id
-		modelCoin, err := models.CoinByID(s.DB, coin.ID)
-		if err != nil {
-			return nil, twirp.InternalError(err.Error())
-		}
-		// populate dbModelCoins
-		dbModelCoins[modelCoin.Denomination] = modelCoin
-	}
-
-	// begin shaking the piggy bank
-	for i := 0; i < int(count); i++ {
-		// simulate chance using rng.
-		chance := rand.Float64()
-		// iterate through all coins in coinCounter
-		for denom, count := range coinCounter {
-			// prob is the % distribution of a coin in the pot
-			prob := float64(count) / float64(totalCoins)
-			// we decrement chance by prob, if chance decrements below 0, we have
-			// randomly shaken the piggy bank such that that denomination falls out
-			chance -= prob
-			if chance < 0 {
-				coinCounter[denom]--
-				totalCoins--
-				// if last coin is removed, delete it from the map
-				if coinCounter[denom] == 0 {
-					delete(coinCounter, denom)
-				}
-				break
-			}
-		}
-	}
-
-	// begin process to update DB
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return nil, twirp.InternalError(err.Error())
 	}
 
-	// if the coin no longer exists in the piggy bank, delete it from db
-	for denom, coin := range dbModelCoins {
-		if _, ok := coinCounter[denom]; !ok {
-			err = coin.Delete(tx)
+	// check pot with pot_id exists, if not return error
+	potId := request.GetPotId()
+	if _, err := models.PotByID(s.DB, potId); err != nil {
+		return nil, twirp.NotFoundError(fmt.Sprintf("pot with id: %v not exist", potId))
+	}
+
+	// if pot with pot_id exists, verify that pot contains requested COINs count to remove
+	coinsInPot, err := models.CoinsInPotsByPot_id(s.DB, int(potId))
+	if err != nil {
+		return nil, twirp.InternalError(err.Error())
+	}
+
+	totalPotCoins := func(coinsInPot []*models.CoinsInPot) int32 {
+		total := int32(0)
+		for _, coinGroup := range coinsInPot {
+			if coinGroup != nil {
+				total += coinGroup.CoinCount
+			}
+		}
+		return total
+	}(coinsInPot)
+
+	numOfCoinsToRemove := request.GetCount()
+	if numOfCoinsToRemove > totalPotCoins {
+		return nil, twirp.InvalidArgumentError(fmt.Sprintf("can not remove: %v coins because pot contains only: %v coins",
+			numOfCoinsToRemove, totalPotCoins), "")
+	}
+
+	// remove the coins with different denominations from the pot
+	toRemove := make(map[int32]int32)
+	rand.Seed(time.Now().UnixNano())
+	for numOfCoinsToRemove > 0 {
+		// get random Coins_Kind and mark it as deleted
+		kinds := CoinKinds()
+		randKind := kinds[rand.Intn(len(kinds))]
+
+		// check if this kind of coins are exists in the pot
+		if found, at := Contains(coinsInPot, randKind); found {
+			if coinsInPot[at].CoinCount > 0 {
+				coinsInPot[at].CoinCount = coinsInPot[at].CoinCount - 1
+				// decrement the total coins to remove by one
+				numOfCoinsToRemove = numOfCoinsToRemove - 1
+				// counts the number of coins deleted of each kind
+				toRemove[randKind] += 1
+			}
 		}
 	}
 
-	// declare response slice
-	var res []*coin_service.Coins
-
-	// iterate through the coins in coinCounter
-	for denom, count := range coinCounter {
-
-		coin := dbModelCoins[denom]
-		// update the CoinCount property on the coin model
-		coin.CoinCount = count
-
-		// save coin
-		err = coin.Save(tx)
+	// now update the coins table with the remaining coins of each kind
+	for _, coinInPot := range coinsInPot {
+		coin, err := models.CoinByID(s.DB, coinInPot.ID)
 		if err != nil {
-			return nil, twirp.InternalError(err.Error())
+			return nil, err
 		}
 
-		// add a ptr to a coin_service.Coins struct to the res slice
-		res = append(res, &coin_service.Coins{
-			Kind:  coin_service.Coins_Kind(denom),
-			Count: count,
-		})
+		err = coin.Save(tx)
+		if err != nil {
+			return nil, twirp.InvalidArgumentError(err.Error(), "")
+		}
 	}
 
 	err = tx.Commit()
@@ -155,7 +129,33 @@ func (s *coinServer) RemoveCoins(ctx context.Context, request *coin_service.Remo
 		return nil, twirp.NotFoundError(err.Error())
 	}
 
-	return &coin_service.CoinsListResponse{
-		Coins: res,
-	}, nil
+	var removed []*coin_service.Coins
+	for kind, count := range toRemove {
+		// append the removed coins
+		removed = append(removed, &coin_service.Coins{
+			Kind:  coin_service.Coins_Kind(kind),
+			Count: count,
+		})
+	}
+
+	return &coin_service.CoinsListResponse{Coins: removed}, nil
+}
+
+func CoinKinds() []int32 {
+
+	v := make([]int32, 0, len(coin_service.Coins_Kind_name))
+
+	for key, _ := range coin_service.Coins_Kind_name {
+		v = append(v, key)
+	}
+	return v
+}
+
+func Contains(coins []*models.CoinsInPot, k int32) (bool, int) {
+	for pos, c := range coins {
+		if c.Denomination == k {
+			return true, pos
+		}
+	}
+	return false, -1
 }
